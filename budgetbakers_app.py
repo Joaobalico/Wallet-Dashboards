@@ -309,7 +309,7 @@ with st.sidebar:
         elif r2_cfg and not local_available:
             _meta = load_r2_metadata(r2_cfg)
         _fetched_at = _meta.get("last_fetch_utc", "unknown")[:19].replace("T", " ")
-        _source_label = "local" if local_available else "R2"
+        _source_label = "locally stored" if local_available else "Stored in R2"
         st.caption(f"Snapshot ({_source_label}) last updated: **{_fetched_at} UTC**")
         use_local = st.radio(
             "Load from",
@@ -435,8 +435,12 @@ if use_local:
         else:
             # Load from R2
             df = load_r2_parquet(r2_cfg["endpoint"], r2_cfg["access_key"], r2_cfg["secret_key"], r2_cfg["bucket"], "records.parquet")
-            acc_df = load_r2_parquet(r2_cfg["endpoint"], r2_cfg["access_key"], r2_cfg["secret_key"], r2_cfg["bucket"], "accounts.parquet") or pd.DataFrame()
-            cat_df = load_r2_parquet(r2_cfg["endpoint"], r2_cfg["access_key"], r2_cfg["secret_key"], r2_cfg["bucket"], "categories.parquet") or pd.DataFrame()
+            acc_df = load_r2_parquet(r2_cfg["endpoint"], r2_cfg["access_key"], r2_cfg["secret_key"], r2_cfg["bucket"], "accounts.parquet")
+            cat_df = load_r2_parquet(r2_cfg["endpoint"], r2_cfg["access_key"], r2_cfg["secret_key"], r2_cfg["bucket"], "categories.parquet")
+            if acc_df is None:
+                acc_df = pd.DataFrame()
+            if cat_df is None:
+                cat_df = pd.DataFrame()
             if df is None:
                 st.error("Could not load data from R2. Check your R2 credentials.")
                 st.stop()
