@@ -655,7 +655,7 @@ c10.metric("👤 Unique Payees", unique_payees)
 st.divider()
 
 # ── Charts ─────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📅 Over Time",
     "🏷️ By Category",
     "🏦 By Account",
@@ -663,6 +663,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🔍 Spending Patterns",
     "📋 Transactions",
     "🏷️ By Label",
+    "🔮 Insights & Forecast",
 ])
 
 # ── Tab 1: Over Time ──────────────────────────────────────
@@ -1625,4 +1626,536 @@ with tab7:
                     use_container_width=True,
                     hide_index=True,
                 )
+
+
+# ── Tab 8: Insights & Forecast ─────────────────────────────
+with tab8:
+    st.markdown(
+        "Data-driven insights and forecasts based on your **full transaction history**. "
+        "All projections use simple statistical models applied to your own data."
+    )
+
+    # Use df_all (full unfiltered history) for forecasting
+    hist = df_all.copy()
+    hist_exp = hist[hist["amount"] < 0].copy()
+    hist_inc = hist[hist["amount"] > 0].copy()
+
+    # Dynamic recent-window size: scales with available data
+    # 3-5 mo data → 3, 6-11 → 4, 12-23 → 6, 24+ → 12
+    total_months = hist_exp["recordDate"].dt.to_period("M").nunique()
+    if total_months >= 24:
+        recent_window = 12
+    elif total_months >= 12:
+        recent_window = 6
+    elif total_months >= 6:
+        recent_window = 4
+    else:
+        recent_window = 3
+
+    # ── 1. Monthly Spending Forecast ──────────────────────
+    st.subheader("📈 Monthly Spending Forecast")
+
+    monthly_exp = (
+        hist_exp
+        .groupby(hist_exp["recordDate"].dt.to_period("M"))["amount"]
+        .sum()
+        .abs()
+        .reset_index()
+    )
+    monthly_exp.columns = ["period", "spent"]
+    monthly_exp["period_dt"] = monthly_exp["period"].apply(lambda p: p.start_time)
+    monthly_exp = monthly_exp.sort_values("period_dt")
+
+    if len(monthly_exp) >= 3:
+        # Exponentially weighted moving average – recent months matter more
+        n = len(monthly_exp)
+        # Weights: most recent month gets highest weight, decaying by half-life
+        weights = np.array([0.5 ** (n - 1 - i) for i in range(n)])
+        weights /= weights.sum()
+        weighted_avg = (monthly_exp["spent"].values * weights).sum()
+
+        # Dynamic recent window for trend & confidence
+        recent = monthly_exp["spent"].tail(recent_window).values
+        recent_avg = recent.mean()
+        recent_std = recent.std() if len(recent) > 1 else 0
+
+        # Forecast next 3 months using weighted average
+        # Blend ratio adapts: more data → trust weighted avg more
+        w_ratio = min(0.5 + n * 0.02, 0.85)
+        base_forecast = w_ratio * weighted_avg + (1 - w_ratio) * recent_avg
+        last_date = monthly_exp["period_dt"].max()
+        fc_rows = []
+        for i in range(1, 4):
+            fc_date = last_date + pd.DateOffset(months=i)
+            fc_rows.append({
+                "period_dt": fc_date,
+                "spent": max(base_forecast, 0),
+                "type": "Forecast",
+            })
+
+        monthly_exp["type"] = "Actual"
+
+        fc_df = pd.DataFrame(fc_rows)
+        plot_data = pd.concat(
+            [monthly_exp[["period_dt", "spent", "type"]], fc_df],
+            ignore_index=True,
+        )
+
+        fig_fc = go.Figure()
+        actual = plot_data[plot_data["type"] == "Actual"]
+        forecast = plot_data[plot_data["type"] == "Forecast"]
+
+        fig_fc.add_trace(go.Bar(
+            x=actual["period_dt"], y=actual["spent"],
+            name="Actual", marker_color="#e74c3c",
+        ))
+        fig_fc.add_trace(go.Bar(
+            x=forecast["period_dt"], y=forecast["spent"],
+            name="Forecast", marker_color="#e74c3c", opacity=0.4,
+        ))
+
+        # Confidence band around forecast
+        if recent_std > 0:
+            fc_dates = [r["period_dt"] for r in fc_rows]
+            upper = [max(base_forecast + recent_std, 0)] * 3
+            lower = [max(base_forecast - recent_std, 0)] * 3
+            fig_fc.add_trace(go.Scatter(
+                x=fc_dates + fc_dates[::-1],
+                y=upper + lower[::-1],
+                fill="toself",
+                fillcolor="rgba(52, 152, 219, 0.15)",
+                line=dict(color="rgba(52, 152, 219, 0)"),
+                name="Confidence Band (±1σ)",
+                hoverinfo="skip",
+            ))
+
+        fig_fc.update_layout(
+            title="Monthly Expenses – Actual & 3-Month Forecast",
+            yaxis_title=f"Amount ({CURRENCY})",
+            hovermode="x unified",
+            legend=dict(orientation="h", y=1.12),
+        )
+        st.plotly_chart(fig_fc, use_container_width=True)
+
+        # Trend based on recent months vs overall
+        if recent_avg > weighted_avg * 1.02:
+            trend_dir = "upward 📈"
+        elif recent_avg < weighted_avg * 0.98:
+            trend_dir = "downward 📉"
+        else:
+            trend_dir = "stable ➡️"
+        monthly_change = recent[-1] - recent[0] if len(recent) > 1 else 0
+        st.info(
+            f"Your recent spending trend is **{trend_dir}** "
+            f"(based on last **{recent_window} months**). "
+            f"Forecast blends weighted history "
+            f"({w_ratio:.0%}) with recent trend "
+            f"({1 - w_ratio:.0%}). "
+            f"Projected next month: "
+            f"**{CURRENCY}{base_forecast:,.2f}** "
+            f"(±{CURRENCY}{recent_std:,.0f})."
+        )
+    else:
+        st.info("Need at least 3 months of history to generate a spending forecast.")
+
+    st.divider()
+
+    # ── 2. End-of-Month Projection (Burn Rate) ──────────
+    st.subheader("🔥 End-of-Month Projection")
+    st.caption("At your current pace this month, here's your projected total.")
+
+    current_month_start = today.replace(day=1)
+    _, days_in_month = monthrange(today.year, today.month)
+    days_elapsed = today.day
+    days_remaining = days_in_month - days_elapsed
+
+    current_month_exp = hist_exp[
+        hist_exp["recordDate"].dt.to_period("M") == pd.Period(today, freq="M")
+    ]
+    current_month_inc = hist_inc[
+        hist_inc["recordDate"].dt.to_period("M") == pd.Period(today, freq="M")
+    ]
+
+    spent_so_far = current_month_exp["amount"].sum()
+    earned_so_far = current_month_inc["amount"].sum()
+    abs_spent = abs(spent_so_far)
+
+    if days_elapsed > 0:
+        daily_rate = abs_spent / days_elapsed
+        projected_total = abs_spent + daily_rate * days_remaining
+        daily_income_rate = earned_so_far / days_elapsed
+        projected_income = earned_so_far + daily_income_rate * days_remaining
+
+        bm1, bm2, bm3, bm4 = st.columns(4)
+        bm1.metric("Spent So Far", f"{CURRENCY}{abs_spent:,.2f}")
+        bm2.metric("Daily Burn Rate", f"{CURRENCY}{daily_rate:,.2f}")
+        bm3.metric(
+            "Projected Month-End Spend",
+            f"{CURRENCY}{projected_total:,.2f}",
+            delta=f"{CURRENCY}{daily_rate * days_remaining:,.2f} remaining",
+            delta_color="inverse",
+        )
+        bm4.metric(
+            "Projected Month-End Income",
+            f"{CURRENCY}{projected_income:,.2f}",
+        )
+
+        # Visual progress bar
+        pct_month = days_elapsed / days_in_month
+        st.progress(pct_month, text=f"Month progress: {days_elapsed}/{days_in_month} days ({pct_month:.0%})")
+
+        # Compare projected total with historical monthly average
+        if len(monthly_exp) >= 2:
+            hist_avg = monthly_exp["spent"].mean()
+            diff = projected_total - hist_avg
+            if diff > 0:
+                st.warning(
+                    f"⚠️ You're projected to spend "
+                    f"**{CURRENCY}{projected_total:,.2f}** "
+                    f"this month — that's "
+                    f"**{CURRENCY}{diff:,.2f}** more than "
+                    f"your historical monthly average of "
+                    f"**{CURRENCY}{hist_avg:,.2f}**."
+                )
+            else:
+                st.success(
+                    f"✅ You're projected to spend "
+                    f"**{CURRENCY}{projected_total:,.2f}** "
+                    f"this month — that's "
+                    f"**{CURRENCY}{abs(diff):,.2f}** less "
+                    f"than your historical monthly average "
+                    f"of **{CURRENCY}{hist_avg:,.2f}**."
+                )
+    else:
+        st.info("No data yet for the current month.")
+
+    st.divider()
+
+    # ── 3. Category Forecast ──────────────────────────────
+    st.subheader("🏷️ Category Spending Forecast")
+    st.caption("Per-category trend direction and projected next-month spend.")
+
+    cat_monthly = (
+        hist_exp
+        .groupby([hist_exp["recordDate"].dt.to_period("M"), "category"])["amount"]
+        .sum()
+        .abs()
+        .reset_index()
+    )
+    cat_monthly.columns = ["period", "category", "spent"]
+    cat_monthly["period_dt"] = cat_monthly["period"].apply(lambda p: p.start_time)
+
+    cat_forecasts = []
+    for cat in cat_monthly["category"].unique():
+        cat_data = cat_monthly[cat_monthly["category"] == cat].sort_values("period_dt")
+        if len(cat_data) < 3:
+            continue
+        nc = len(cat_data)
+        y = cat_data["spent"].values
+        avg_val = y.mean()
+        last_val = y[-1]
+
+        # Weighted average per category (same approach as overall)
+        cat_weights = np.array([0.5 ** (nc - 1 - i) for i in range(nc)])
+        cat_weights /= cat_weights.sum()
+        cat_wavg = (y * cat_weights).sum()
+
+        # Dynamic recent window (capped to available months)
+        cat_recent_win = min(recent_window, nc)
+        cat_recent = y[-cat_recent_win:]
+        cat_recent_avg = cat_recent.mean()
+
+        # Blend for forecast
+        cat_w = min(0.5 + nc * 0.02, 0.85)
+        next_val = max(cat_w * cat_wavg + (1 - cat_w) * cat_recent_avg, 0)
+
+        # Trend: compare recent window avg to weighted avg
+        if avg_val > 0:
+            trend_delta = cat_recent_avg - cat_wavg
+            slope_c = trend_delta / max(cat_recent_win, 1)
+            pct_change = abs(trend_delta) / avg_val
+        else:
+            slope_c = 0
+            pct_change = 0
+        if pct_change < 0.02:
+            direction = "➡️ Stable"
+        elif cat_recent_avg > cat_wavg:
+            direction = "📈 Up"
+        else:
+            direction = "📉 Down"
+        trend_pct = (slope_c / avg_val * 100) if avg_val > 0 else 0
+        cat_forecasts.append({
+            "Category": cat,
+            "Avg Monthly": avg_val,
+            "Last Month": last_val,
+            "Forecast Next Month": next_val,
+            "Trend (€/mo)": slope_c,
+            "Trend (%)": trend_pct,
+            "_trend_numeric": slope_c,
+            "Direction": direction,
+        })
+
+    if cat_forecasts:
+        cat_fc_df = pd.DataFrame(cat_forecasts).sort_values("Forecast Next Month", ascending=False)
+
+        st.dataframe(
+            cat_fc_df.drop(columns=["_trend_numeric"]).style.format({
+                "Avg Monthly": f"{CURRENCY}{{:,.2f}}",
+                "Last Month": f"{CURRENCY}{{:,.2f}}",
+                "Forecast Next Month": f"{CURRENCY}{{:,.2f}}",
+                "Trend (€/mo)": f"{CURRENCY}{{:+,.2f}}",
+                "Trend (%)": "{:+.1f}%",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Bar chart: top rising vs falling categories
+        rising = cat_fc_df[cat_fc_df["Direction"] == "📈 Up"].nlargest(5, "_trend_numeric")
+        falling = cat_fc_df[cat_fc_df["Direction"] == "📉 Down"].nsmallest(5, "_trend_numeric")
+
+        if not rising.empty or not falling.empty:
+            trend_data = pd.concat([rising, falling])
+            trend_data["color"] = trend_data["Direction"].apply(
+                lambda v: "Rising" if v == "📈 Up" else "Falling"
+            )
+            fig_trend = px.bar(
+                trend_data,
+                x="_trend_numeric",
+                y="Category",
+                orientation="h",
+                color="color",
+                color_discrete_map={"Rising": "#e74c3c", "Falling": "#2ecc71"},
+                title="Categories Trending Up (costing more) vs Down",
+                labels={"_trend_numeric": f"Trend ({CURRENCY}/mo)"},
+            )
+            fig_trend.update_layout(yaxis=dict(autorange="reversed"), showlegend=True)
+            st.plotly_chart(fig_trend, use_container_width=True)
+    else:
+        st.info("Need at least 3 months of history per category for forecasts.")
+
+    st.divider()
+
+    # ── 4. Anomaly Detection ──────────────────────────────
+    st.subheader("🚨 Spending Anomalies")
+    st.caption(
+        "Transactions flagged as unusually large based on your per-category "
+        "spending distribution (> 2 standard deviations above the mean)."
+    )
+
+    anomalies = []
+    for cat in hist_exp["category"].unique():
+        cat_txns = hist_exp[hist_exp["category"] == cat]["amount"].abs()
+        if len(cat_txns) < 5:
+            continue
+        mean_val = cat_txns.mean()
+        std_val = cat_txns.std()
+        if std_val == 0:
+            continue
+        threshold = mean_val + 2 * std_val
+        flagged = hist_exp[
+            (hist_exp["category"] == cat) & (hist_exp["amount"].abs() > threshold)
+        ]
+        for _, row in flagged.iterrows():
+            anomalies.append({
+                "Date": row["recordDate"],
+                "Category": cat,
+                "Amount": abs(row["amount"]),
+                "Cat. Mean": mean_val,
+                "Cat. Std": std_val,
+                "Payee": row.get("payee", ""),
+                "σ Above Mean": (abs(row["amount"]) - mean_val) / std_val,
+            })
+
+    if anomalies:
+        anom_df = pd.DataFrame(anomalies).sort_values("Date", ascending=False).head(20)
+        st.dataframe(
+            anom_df.style.format({
+                "Amount": f"{CURRENCY}{{:,.2f}}",
+                "Cat. Mean": f"{CURRENCY}{{:,.2f}}",
+                "Cat. Std": f"{CURRENCY}{{:,.2f}}",
+                "σ Above Mean": "{:.1f}σ",
+                "Date": lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.success("No anomalous transactions detected.")
+
+    st.divider()
+
+    # ── 5. Recurring Expense Detection ────────────────────
+    st.subheader("🔄 Detected Recurring Expenses")
+    st.caption(
+        "Payees that appear consistently month-over-month with similar amounts – likely subscriptions or bills."
+    )
+
+    if hist_exp["payee"].notna().sum() > 0:
+        payee_monthly = (
+            hist_exp[hist_exp["payee"].notna()]
+            .groupby([hist_exp.loc[hist_exp["payee"].notna(), "recordDate"].dt.to_period("M"), "payee"])["amount"]
+            .sum()
+            .abs()
+            .reset_index()
+        )
+        payee_monthly.columns = ["period", "payee", "amount"]
+
+        total_months = hist_exp["recordDate"].dt.to_period("M").nunique()
+        payee_stats = (
+            payee_monthly.groupby("payee")
+            .agg(
+                months_present=("period", "nunique"),
+                avg_amount=("amount", "mean"),
+                std_amount=("amount", "std"),
+                total=("amount", "sum"),
+            )
+            .reset_index()
+        )
+        payee_stats["std_amount"] = payee_stats["std_amount"].fillna(0)
+        payee_stats["frequency"] = payee_stats["months_present"] / max(total_months, 1)
+        # Recurring = appears in >50% of months with low relative variability
+        payee_stats["cv"] = np.where(
+            payee_stats["avg_amount"] > 0,
+            payee_stats["std_amount"] / payee_stats["avg_amount"],
+            999,
+        )
+        recurring = payee_stats[
+            (payee_stats["frequency"] >= 0.5)
+            & (payee_stats["months_present"] >= 3)
+            & (payee_stats["cv"] < 0.5)
+        ].sort_values("total", ascending=False)
+
+        if not recurring.empty:
+            recurring_display = recurring.rename(columns={
+                "payee": "Payee",
+                "months_present": "Months Active",
+                "avg_amount": "Avg Monthly",
+                "total": "Total Spent",
+                "frequency": "Frequency",
+            })[["Payee", "Months Active", "Avg Monthly", "Total Spent", "Frequency"]]
+
+            annual_recurring = recurring["avg_amount"].sum() * 12
+            st.metric(
+                "Estimated Annual Recurring Cost",
+                f"{CURRENCY}{annual_recurring:,.2f}",
+                help="Sum of average monthly amounts × 12",
+            )
+
+            st.dataframe(
+                recurring_display.style.format({
+                    "Avg Monthly": f"{CURRENCY}{{:,.2f}}",
+                    "Total Spent": f"{CURRENCY}{{:,.2f}}",
+                    "Frequency": "{:.0%}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No clear recurring expenses detected yet.")
+    else:
+        st.info("No payee data available for recurring detection.")
+
+    st.divider()
+
+    # ── 6. Savings Projection ─────────────────────────────
+    st.subheader("💰 Savings Projection")
+
+    monthly_net = (
+        hist
+        .groupby(hist["recordDate"].dt.to_period("M"))["amount"]
+        .sum()
+        .reset_index()
+    )
+    monthly_net.columns = ["period", "net"]
+    monthly_net["period_dt"] = monthly_net["period"].apply(lambda p: p.start_time)
+    monthly_net = monthly_net.sort_values("period_dt")
+
+    if len(monthly_net) >= 3:
+        avg_monthly_savings = monthly_net["net"].mean()
+        # Dynamic window for recent savings rate
+        savings_win = min(recent_window, len(monthly_net))
+        recent_savings = monthly_net["net"].tail(savings_win).mean()
+
+        sp1, sp2 = st.columns(2)
+        sp1.metric("Avg Monthly Savings (all-time)", f"{CURRENCY}{avg_monthly_savings:,.2f}")
+        sp2.metric(f"Avg Monthly Savings (last {savings_win} mo)", f"{CURRENCY}{recent_savings:,.2f}")
+
+        # Project cumulative savings over next 12 months
+        projection_months = 12
+        proj_rows = []
+        cumulative = 0
+        for i in range(1, projection_months + 1):
+            cumulative += recent_savings
+            proj_date = monthly_net["period_dt"].max() + pd.DateOffset(months=i)
+            proj_rows.append({"Month": proj_date, "Cumulative Savings": cumulative})
+
+        proj_df = pd.DataFrame(proj_rows)
+
+        fig_savings = go.Figure()
+        fig_savings.add_trace(go.Scatter(
+            x=proj_df["Month"], y=proj_df["Cumulative Savings"],
+            mode="lines+markers+text",
+            text=[f"{CURRENCY}{v:,.0f}" for v in proj_df["Cumulative Savings"]],
+            textposition="top center",
+            line=dict(color="#2ecc71", width=3),
+            marker=dict(size=8),
+        ))
+        fig_savings.update_layout(
+            title=f"Projected Cumulative Savings (next {projection_months} months)",
+            yaxis_title=f"Cumulative ({CURRENCY})",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_savings, use_container_width=True)
+
+        if recent_savings > 0:
+            st.success(
+                f"At your recent savings rate of **{CURRENCY}{recent_savings:,.2f}/month** "
+                f"(last {savings_win} months), "
+                f"you're on track to save **{CURRENCY}{recent_savings * 12:,.2f}** over the next year."
+            )
+        else:
+            st.warning(
+                f"Your recent {savings_win}-month average net is **{CURRENCY}{recent_savings:,.2f}/month**. "
+                f"Consider reviewing expenses to improve your savings rate."
+            )
+    else:
+        st.info("Need at least 3 months of data for savings projections.")
+
+    st.divider()
+
+    # ── 7. Weekday vs Weekend Insight ─────────────────────
+    st.subheader("📊 Weekday vs Weekend Spending")
+
+    hist_exp["is_weekend"] = hist_exp["recordDate"].dt.dayofweek >= 5
+    we_summary = (
+        hist_exp.groupby("is_weekend")["amount"]
+        .agg(["sum", "count", "mean"])
+        .abs()
+        .reset_index()
+    )
+    we_summary["label"] = we_summary["is_weekend"].map({True: "Weekend", False: "Weekday"})
+    we_summary.rename(columns={"sum": "Total", "count": "Transactions", "mean": "Avg per Txn"}, inplace=True)
+
+    wk1, wk2 = st.columns(2)
+    with wk1:
+        fig_we = px.pie(
+            we_summary, names="label", values="Total",
+            title="Total Spending Split",
+            hole=0.4,
+            color_discrete_map={"Weekday": "#3498db", "Weekend": "#e67e22"},
+        )
+        fig_we.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig_we, use_container_width=True)
+    with wk2:
+        st.dataframe(
+            we_summary[["label", "Total", "Transactions", "Avg per Txn"]].rename(
+                columns={"label": "Period"}
+            ).style.format({
+                "Total": f"{CURRENCY}{{:,.2f}}",
+                "Avg per Txn": f"{CURRENCY}{{:,.2f}}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
 
