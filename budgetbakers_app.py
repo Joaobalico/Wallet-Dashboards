@@ -62,6 +62,22 @@ st.markdown("""
     [data-testid="stMetric"]:nth-of-type(3) {
         border-left-color: #3498db;
     }
+    /* Scale down the whole app so it fits at 100% browser zoom */
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
+        font-size: 13px;
+    }
+    [data-testid="stMetric"] {
+        padding: 8px 12px;
+    }
+    h1 { font-size: 1.6rem !important; }
+    h2 { font-size: 1.3rem !important; }
+    h3 { font-size: 1.1rem !important; }
+    /* Force sidebar radio buttons to 2 per row */
+    [data-testid="stSidebar"] [role="radiogroup"] {
+        display: grid !important;
+        grid-template-columns: 1fr 1fr !important;
+        gap: 4px !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -129,21 +145,6 @@ def fetch_all_pages(token: str, path: str, params: dict | None = None) -> list[d
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image(
-        "https://budgetbakers.com/images/wallet-icon.png",
-        width=60,
-    )
-    st.title("BudgetBakers")
-    st.caption("Wallet REST API Dashboard")
-
-    st.divider()
-
-    if TOKEN:
-        st.success("🔑 API token loaded from `.env`", icon="✅")
-    else:
-        st.error("No `API_TOKEN` found in `.env`.")
-
-    st.divider()
 
     # ── Data source ───────────────────────────────────────────────────────────
     historical_available = (HISTORICAL_DIR / "records.parquet").exists()
@@ -172,15 +173,41 @@ with st.sidebar:
     today = date.today()
 
     # Quick date range buttons
-    quick_range = st.radio(
+    def _on_default_toggle():
+        """When Default is toggled off, restore previous radio selection or default to Custom."""
+        if not st.session_state["default_toggle"]:
+            prev = st.session_state.get("_prev_quick_range")
+            st.session_state["quick_range"] = prev if prev else "Custom"
+
+    def _on_quick_range_change():
+        """Remember the last radio selection so toggling Default preserves it."""
+        st.session_state["_prev_quick_range"] = st.session_state["quick_range"]
+
+    is_default = st.toggle("Default", value=True, key="default_toggle",
+                           on_change=_on_default_toggle)
+
+    quick_range_radio = st.radio(
         "Quick range",
         ["Custom", "Today", "This Week", "This Month", "6 Months", "This Year"],
-        index=2,  # default: This Month
+        index=None if is_default else 0,
         horizontal=True,
         key="quick_range",
+        disabled=is_default,
+        on_change=_on_quick_range_change,
     )
 
-    if quick_range == "Today":
+    quick_range = "Default" if is_default else (quick_range_radio or "Custom")
+
+    if quick_range == "Default":
+        # From the most recent 26th to today
+        if today.day >= 26:
+            _qfrom = today.replace(day=26)
+        else:
+            first_this_month = today.replace(day=1)
+            prev_month = first_this_month - timedelta(days=1)
+            _qfrom = prev_month.replace(day=26)
+        _qto = today
+    elif quick_range == "Today":
         _qfrom, _qto = today, today
     elif quick_range == "This Week":
         _qfrom = today - timedelta(days=(today.weekday() + 1) % 7)  # Sunday
@@ -226,7 +253,7 @@ with st.sidebar:
 
 
 # ── Main area ──────────────────────────────────────────────────────────────────
-st.title("💰 Wallet Dashboards")
+st.title("💰 BudgetBakers Wallet Dashboards")
 
 token = TOKEN  # sourced from .env
 
@@ -402,7 +429,7 @@ with st.sidebar:
 # Filter out records that carry any excluded label
 if exclude_labels:
     df = df[~df["label"].apply(
-        lambda x: any(lbl in (x or "") for lbl in exclude_labels)
+        lambda x: any(lbl in x for lbl in exclude_labels) if isinstance(x, str) else False
     )].copy()
 
 # Exclude transfers – they are not real income/expenses
@@ -435,7 +462,7 @@ else:
     df_all["label"] = None
 if exclude_labels:
     df_all = df_all[~df_all["label"].apply(
-        lambda x: any(lbl in (x or "") for lbl in exclude_labels)
+        lambda x: any(lbl in x for lbl in exclude_labels) if isinstance(x, str) else False
     )].copy()
 df_all = df_all[~df_all["category"].isin(TRANSFER_CATEGORIES)].copy()
 df_all["day"] = df_all["recordDate"].dt.date
@@ -657,22 +684,45 @@ with tab2:
             .sort_values("Amount", ascending=False)
         )
 
+        # Add percentage labels for the legend
+        total = cat_agg["Amount"].sum()
+        cat_agg["legend_label"] = cat_agg.apply(
+            lambda r: f"{r['category']} ({r['Amount'] / total * 100:.1f}%)" if total else r["category"],
+            axis=1,
+        )
+
         col_chart, col_pie = st.columns([1, 1])
 
         with col_pie:
+            # Top 4 categories + "Others" grouping the rest
+            top4 = cat_agg.head(4).copy()
+            others_amount = cat_agg.iloc[4:]["Amount"].sum() if len(cat_agg) > 4 else 0
+
+            if others_amount > 0:
+                others_pct = others_amount / total * 100 if total else 0
+                others_row = pd.DataFrame([{
+                    "category": "Others",
+                    "Amount": others_amount,
+                    "legend_label": f"Others ({others_pct:.1f}%)",
+                }])
+                pie_data = pd.concat([top4, others_row], ignore_index=True)
+            else:
+                pie_data = top4.copy()
+
             fig_pie = px.pie(
-                cat_agg, names="category", values="Amount",
+                pie_data, names="legend_label", values="Amount",
                 title=f"{cat_view} by Category",
                 hole=0.4,
             )
             fig_pie.update_traces(
                 textposition="inside",
-                textinfo="percent+label",
+                textinfo="percent+text",
+                text=pie_data["category"].tolist(),
             )
             st.plotly_chart(fig_pie, use_container_width=True)
 
         with col_chart:
-            top_n = min(15, len(cat_agg))
+            top_n = min(10, len(cat_agg))
             fig_bar = px.bar(
                 cat_agg.head(top_n),
                 x="Amount",
@@ -748,6 +798,67 @@ with tab3:
         hide_index=True,
     )
 
+    # ── Account drill-down ─────────────────────────────────
+    st.divider()
+    st.subheader("🔍 Account Drill-Down")
+    account_names = sorted(df["account"].dropna().unique().tolist())
+    selected_account = st.selectbox(
+        "Select an account", options=account_names, key="acc_drilldown",
+    )
+
+    if selected_account:
+        acc_df_drill = df[df["account"] == selected_account]
+        acc_inc = acc_df_drill[acc_df_drill["amount"] > 0]["amount"].sum()
+        acc_exp = acc_df_drill[acc_df_drill["amount"] < 0]["amount"].sum()
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Income", f"{CURRENCY}{acc_inc:,.2f}")
+        m2.metric("Expenses", f"{CURRENCY}{abs(acc_exp):,.2f}")
+        m3.metric("Net", f"{CURRENCY}{(acc_inc + acc_exp):,.2f}")
+
+        # Category breakdown for this account
+        acc_cat = (
+            acc_df_drill[acc_df_drill["amount"] < 0]
+            .groupby("category")["amount"].sum().abs()
+            .reset_index().rename(columns={"amount": "Spent"})
+            .sort_values("Spent", ascending=False)
+        )
+        if not acc_cat.empty:
+            ad_col1, ad_col2 = st.columns(2)
+            with ad_col1:
+                fig_acc_cat = px.pie(
+                    acc_cat, names="category", values="Spent",
+                    title=f"Expense Categories – {selected_account}",
+                    hole=0.4,
+                )
+                fig_acc_cat.update_traces(textposition="inside", textinfo="percent+label")
+                st.plotly_chart(fig_acc_cat, use_container_width=True)
+            with ad_col2:
+                st.dataframe(
+                    acc_cat.style.format({"Spent": f"{CURRENCY}{{:,.2f}}"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+        # Recent transactions for this account
+        st.markdown(f"**Recent transactions – {selected_account}**")
+        acc_tx_cols = [c for c in ["recordDate", "payee", "category", "amount", "label", "note"] if c in acc_df_drill.columns]
+        acc_tx = (
+            acc_df_drill[acc_tx_cols]
+            .sort_values("recordDate", ascending=False)
+            .head(20)
+            .rename(columns={
+                "recordDate": "Date", "payee": "Payee", "category": "Category",
+                "amount": "Amount", "label": "Labels", "note": "Note",
+            })
+        )
+        st.dataframe(
+            acc_tx.style.format({
+                "Amount": f"{CURRENCY}{{:,.2f}}",
+                "Date": lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+
 
 # ── Tab 4: Monthly Comparison ─────────────────────────────
 with tab4:
@@ -767,73 +878,7 @@ with tab4:
         .rename(columns={"month": "Month"})
     )
 
-    fig_monthly = go.Figure()
-    fig_monthly.add_trace(go.Bar(
-        x=monthly["Month"], y=monthly["Income"],
-        name="Income", marker_color="#2ecc71",
-    ))
-    fig_monthly.add_trace(go.Bar(
-        x=monthly["Month"], y=monthly["Expenses"],
-        name="Expenses", marker_color="#e74c3c",
-    ))
-    fig_monthly.add_trace(go.Scatter(
-        x=monthly["Month"], y=monthly["Net"],
-        name="Net", mode="lines+markers",
-        line=dict(color="#3498db", width=3),
-    ))
-    fig_monthly.update_layout(
-        title="Monthly Income vs Expenses",
-        barmode="group",
-        hovermode="x unified",
-        legend=dict(orientation="h", y=1.12),
-    )
-    st.plotly_chart(fig_monthly, use_container_width=True)
-
-    # Category trend over months
-    st.subheader("Category Trend Over Time")
-    expense_cats = (
-        df[df["amount"] < 0]
-        .groupby("category")["amount"]
-        .sum()
-        .abs()
-        .nlargest(8)
-        .index.tolist()
-    )
-    if expense_cats:
-        cat_monthly = (
-            df[df["category"].isin(expense_cats)]
-            .groupby(["month", "category"])["amount"]
-            .sum()
-            .abs()
-            .reset_index()
-        )
-        fig_cat_trend = px.line(
-            cat_monthly,
-            x="month",
-            y="amount",
-            color="category",
-            markers=True,
-            title="Top Categories Over Time",
-        )
-        fig_cat_trend.update_layout(
-            xaxis_title="Month",
-            yaxis_title="Amount",
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig_cat_trend, use_container_width=True)
-
-    st.dataframe(
-        monthly.style.format({
-            "Income": f"{CURRENCY}{{:,.2f}}",
-            "Expenses": f"{CURRENCY}{{:,.2f}}",
-            "Net": f"{CURRENCY}{{:,.2f}}",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
-
     # ── Custom Period Comparison ───────────────────────────
-    st.divider()
     st.subheader("Compare with Another Period")
     st.caption(
         f"**Current period** is your sidebar filter: "
@@ -845,7 +890,17 @@ with tab4:
     all_max = df_all["day"].max()
 
     # Smart comparison defaults based on quick_range selection
-    if quick_range == "Today":
+    if quick_range == "Default":
+        # Previous 26th-to-25th cycle
+        # date_from is the current cycle's 26th
+        # Compare: one month before that 26th → day before date_from (25th)
+        default_cmp_to = date_from - timedelta(days=1)  # the 25th before current start
+        # Go back one month from date_from for the compare start
+        if date_from.month == 1:
+            default_cmp_from = date(date_from.year - 1, 12, 26)
+        else:
+            default_cmp_from = date(date_from.year, date_from.month - 1, 26)
+    elif quick_range == "Today":
         # Compare with yesterday
         default_cmp_from = today - timedelta(days=1)
         default_cmp_to = today - timedelta(days=1)
@@ -1050,6 +1105,73 @@ with tab4:
             )
         else:
             st.info("No expenses in either period to compare.")
+
+    # ── Monthly Income vs Expenses ─────────────────────────
+    st.divider()
+    fig_monthly = go.Figure()
+    fig_monthly.add_trace(go.Bar(
+        x=monthly["Month"], y=monthly["Income"],
+        name="Income", marker_color="#2ecc71",
+    ))
+    fig_monthly.add_trace(go.Bar(
+        x=monthly["Month"], y=monthly["Expenses"],
+        name="Expenses", marker_color="#e74c3c",
+    ))
+    fig_monthly.add_trace(go.Scatter(
+        x=monthly["Month"], y=monthly["Net"],
+        name="Net", mode="lines+markers",
+        line=dict(color="#3498db", width=3),
+    ))
+    fig_monthly.update_layout(
+        title="Monthly Income vs Expenses",
+        barmode="group",
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.12),
+    )
+    st.plotly_chart(fig_monthly, use_container_width=True)
+
+    # Category trend over months
+    st.subheader("Category Trend Over Time")
+    expense_cats = (
+        df[df["amount"] < 0]
+        .groupby("category")["amount"]
+        .sum()
+        .abs()
+        .nlargest(8)
+        .index.tolist()
+    )
+    if expense_cats:
+        cat_monthly = (
+            df[df["category"].isin(expense_cats)]
+            .groupby(["month", "category"])["amount"]
+            .sum()
+            .abs()
+            .reset_index()
+        )
+        fig_cat_trend = px.line(
+            cat_monthly,
+            x="month",
+            y="amount",
+            color="category",
+            markers=True,
+            title="Top Categories Over Time",
+        )
+        fig_cat_trend.update_layout(
+            xaxis_title="Month",
+            yaxis_title="Amount",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_cat_trend, use_container_width=True)
+
+    st.dataframe(
+        monthly.style.format({
+            "Income": f"{CURRENCY}{{:,.2f}}",
+            "Expenses": f"{CURRENCY}{{:,.2f}}",
+            "Net": f"{CURRENCY}{{:,.2f}}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 # ── Tab 5: Spending Patterns ──────────────────────────────
@@ -1383,24 +1505,3 @@ with tab7:
                     hide_index=True,
                 )
 
-
-# ── Accounts overview ──────────────────────────────────────
-if not accounts_display.empty:
-    st.divider()
-    st.subheader("🏦 Accounts")
-    display_cols = [
-        c for c in [
-            "name", "currencyCode", "balance", "type",
-        ]
-        if c in accounts_display.columns
-    ]
-    st.dataframe(
-        accounts_display[display_cols].rename(columns={
-            "name": "Name",
-            "currencyCode": "Currency",
-            "balance": "Balance",
-            "type": "Type",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
