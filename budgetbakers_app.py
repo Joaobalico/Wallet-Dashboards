@@ -291,6 +291,11 @@ if use_local:
         df["recordDate"] = pd.to_datetime(df["recordDate"], errors="coerce", utc=True)
         df["recordDate"] = df["recordDate"].dt.tz_localize(None)  # make tz-naive for comparisons
 
+        # Ensure all expected columns exist (parity with Live API path)
+        for col in ["amount", "payee", "note", "recordDate", "categoryId", "accountId", "type"]:
+            if col not in df.columns:
+                df[col] = None
+
         # Keep a full copy before filtering (used for period comparison)
         df_all_raw = df.copy()
 
@@ -313,11 +318,10 @@ if use_local:
         acc_df  = pd.read_parquet(HISTORICAL_DIR / "accounts.parquet")   if (HISTORICAL_DIR / "accounts.parquet").exists()   else pd.DataFrame()
         cat_df  = pd.read_parquet(HISTORICAL_DIR / "categories.parquet") if (HISTORICAL_DIR / "categories.parquet").exists() else pd.DataFrame()
         account_map  = dict(zip(acc_df["id"], acc_df["name"])) if not acc_df.empty and "id" in acc_df.columns else {}
-        # Build category map from local data if available, else from categories parquet
-        if "categoryId" in df.columns and "categoryName" in df.columns:
-            category_map = dict(zip(df["categoryId"].dropna(), df["categoryName"].dropna()))
-        else:
-            category_map = dict(zip(cat_df["id"], cat_df["name"])) if not cat_df.empty and "id" in cat_df.columns else {}
+        # Build category map: start from categories parquet, then overlay inline names from full data
+        category_map = dict(zip(cat_df["id"], cat_df["name"])) if not cat_df.empty and "id" in cat_df.columns else {}
+        if "categoryId" in df_all_raw.columns and "categoryName" in df_all_raw.columns:
+            category_map.update(dict(zip(df_all_raw["categoryId"].dropna(), df_all_raw["categoryName"].dropna())))
         accounts_display = acc_df
 
     st.info("📂 Showing data from local snapshot. Switch to **Live API** in the sidebar to fetch fresh data.")
@@ -363,7 +367,8 @@ else:
             lambda x: x.get("name") if isinstance(x, dict) else None
         )
 
-    df["recordDate"] = pd.to_datetime(df["recordDate"], errors="coerce")
+    df["recordDate"] = pd.to_datetime(df["recordDate"], errors="coerce", utc=True)
+    df["recordDate"] = df["recordDate"].dt.tz_localize(None)  # make tz-naive (parity with local path)
 
     # Keep full copy before filtering (used for period comparison)
     df_all_raw = df.copy()
