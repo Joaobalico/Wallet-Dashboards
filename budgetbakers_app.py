@@ -4,6 +4,7 @@ Connects to the official REST API at https://rest.budgetbakers.com/wallet
 Requires a Premium Wallet account and a Bearer API token.
 """
 
+import hmac
 import os
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from dotenv import load_dotenv
 
-load_dotenv()  # reads .env from the project root
+load_dotenv()  # reads .env for local dev; on Streamlit Cloud, st.secrets is used
 
 HISTORICAL_DIR = Path("historical_data")
 CURRENCY = "€"
@@ -36,13 +37,47 @@ CATEGORY_TRANSLATION = {
 
 # ── Configuration ───────────────────────────────────────────
 BASE_URL = "https://rest.budgetbakers.com/wallet/v1/api"
-TOKEN = os.getenv("API_TOKEN", "")
+# Prefer st.secrets (Streamlit Cloud); fall back to env var (local dev)
+TOKEN = st.secrets.get("API_TOKEN", "") or os.getenv("API_TOKEN", "")
 
 st.set_page_config(
     page_title="BudgetBakers Dashboard",
     page_icon="💰",
     layout="wide",
 )
+
+# ── Password gate ──────────────────────────────────────────
+def check_password() -> bool:
+    """Show a login form and return True only if the correct password is entered."""
+    def _password_entered():
+        """Check whether the password is correct."""
+        if hmac.compare_digest(
+            st.session_state.get("password", ""),
+            st.secrets.get("APP_PASSWORD", ""),
+        ):
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # don't keep it around
+        else:
+            st.session_state["password_correct"] = False
+
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # No APP_PASSWORD configured → skip auth (local dev)
+    if not st.secrets.get("APP_PASSWORD", ""):
+        return True
+
+    st.text_input(
+        "Password", type="password", key="password",
+        on_change=_password_entered,
+    )
+    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+        st.error("😕 Incorrect password")
+    return False
+
+
+if not check_password():
+    st.stop()
 
 # ── Custom CSS for better styling ──────────────────────────
 st.markdown("""
