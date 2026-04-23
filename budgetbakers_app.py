@@ -5,6 +5,8 @@ Requires a Premium Wallet account and a Bearer API token.
 """
 
 import hmac
+import io
+import json as _json
 import os
 from pathlib import Path
 
@@ -37,8 +39,18 @@ CATEGORY_TRANSLATION = {
 
 # ── Configuration ───────────────────────────────────────────
 BASE_URL = "https://rest.budgetbakers.com/wallet/v1/api"
+
+
+def _secret(key: str, default: str = "") -> str:
+    """Read from st.secrets if available, else return default."""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
 # Prefer st.secrets (Streamlit Cloud); fall back to env var (local dev)
-TOKEN = st.secrets.get("API_TOKEN", "") or os.getenv("API_TOKEN", "")
+TOKEN = _secret("API_TOKEN") or os.getenv("API_TOKEN", "")
 
 st.set_page_config(
     page_title="BudgetBakers Dashboard",
@@ -53,7 +65,7 @@ def check_password() -> bool:
         """Check whether the password is correct."""
         if hmac.compare_digest(
             st.session_state.get("password", ""),
-            st.secrets.get("APP_PASSWORD", ""),
+            _secret("APP_PASSWORD"),
         ):
             st.session_state["password_correct"] = True
             del st.session_state["password"]  # don't keep it around
@@ -64,7 +76,7 @@ def check_password() -> bool:
         return True
 
     # No APP_PASSWORD configured → skip auth (local dev)
-    if not st.secrets.get("APP_PASSWORD", ""):
+    if not _secret("APP_PASSWORD"):
         return True
 
     st.text_input(
@@ -178,29 +190,135 @@ def fetch_all_pages(token: str, path: str, params: dict | None = None) -> list[d
     return results
 
 
+@st.cache_data(show_spinner="Fetching data from API…")
+def fetch_wallet_data(_token: str) -> tuple[list, list, list]:
+    """Fetch all records, accounts, and categories. Cached until manually cleared."""
+    records = fetch_all_pages(_token, "/records", {"limit": 200})
+    accounts = api_get(_token, "/accounts") or []
+    categories = api_get(_token, "/categories") or []
+    return records, accounts, categories
+
+
+def build_dataframe(records_raw: list, accounts_raw: list, categories_raw: list):
+    """Transform raw API responses into processed DataFrames and lookup maps."""
+    if isinstance(accounts_raw, dict):
+        accounts_raw = accounts_raw.get("accounts") or accounts_raw.get("items") or []
+    if isinstance(categories_raw, dict):
+        categories_raw = categories_raw.get("categories") or categories_raw.get("items") or []
+
+    account_map = {a["id"]: a.get("name", a["id"]) for a in accounts_raw}
+    category_map = {c["id"]: c.get("name", c["id"]) for c in categories_raw}
+
+    df = pd.DataFrame(records_raw)
+    for col in ["amount", "payee", "note", "recordDate", "categoryId", "accountId", "type"]:
+        if col not in df.columns:
+            df[col] = None
+
+    if "baseAmount" in df.columns:
+        df["amount"] = df["baseAmount"].apply(
+            lambda x: x["value"] if isinstance(x, dict) and "value" in x else None
+        )
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+
+    if "category" in df.columns and df["category"].apply(lambda x: isinstance(x, dict)).any():
+        df["categoryId"] = df["category"].apply(
+            lambda x: x.get("id") if isinstance(x, dict) else None
+        )
+        df["categoryName"] = df["category"].apply(
+            lambda x: x.get("name") if isinstance(x, dict) else None
+        )
+
+    df["recordDate"] = pd.to_datetime(df["recordDate"], errors="coerce", utc=True)
+    df["recordDate"] = df["recordDate"].dt.tz_localize(None)
+
+    return df, account_map, category_map, pd.DataFrame(accounts_raw)
+
+
+# ── R2 helpers ─────────────────────────────────────────────────────────────────
+def _get_r2_config() -> dict | None:
+    """Return R2 credentials from st.secrets or env vars. None if not configured."""
+    endpoint = _secret("R2_ENDPOINT") or os.getenv("R2_ENDPOINT", "")
+    access_key = _secret("R2_ACCESS_KEY_ID") or os.getenv("R2_ACCESS_KEY_ID", "")
+    secret_key = _secret("R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY", "")
+    bucket = _secret("R2_BUCKET") or os.getenv("R2_BUCKET", "")
+    if all([endpoint, access_key, secret_key, bucket]):
+        return {
+            "endpoint": endpoint,
+            "access_key": access_key,
+            "secret_key": secret_key,
+            "bucket": bucket,
+        }
+    return None
+
+
+@st.cache_data(show_spinner="Loading data from R2…", ttl=3600)
+def load_r2_parquet(endpoint: str, access_key: str, secret_key: str, bucket: str, key: str) -> pd.DataFrame | None:
+    """Download a parquet file from Cloudflare R2 and return as DataFrame."""
+    import boto3
+    from botocore.config import Config
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return pd.read_parquet(io.BytesIO(obj["Body"].read()))
+    except s3.exceptions.NoSuchKey:
+        return None
+    except Exception:
+        return None
+
+
+def load_r2_metadata(r2_cfg: dict) -> dict:
+    """Download metadata.json from R2."""
+    import boto3
+    from botocore.config import Config
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=r2_cfg["endpoint"],
+        aws_access_key_id=r2_cfg["access_key"],
+        aws_secret_access_key=r2_cfg["secret_key"],
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
+    try:
+        obj = s3.get_object(Bucket=r2_cfg["bucket"], Key="metadata.json")
+        return _json.loads(obj["Body"].read())
+    except Exception:
+        return {}
+
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
 
     # ── Data source ───────────────────────────────────────────────────────────
-    historical_available = (HISTORICAL_DIR / "records.parquet").exists()
+    local_available = (HISTORICAL_DIR / "records.parquet").exists()
+    r2_cfg = _get_r2_config()
+    historical_available = local_available or (r2_cfg is not None)
 
     st.subheader("Data source")
     if historical_available:
-        import json as _json
         _meta = {}
-        if (HISTORICAL_DIR / "metadata.json").exists():
+        if local_available and (HISTORICAL_DIR / "metadata.json").exists():
             with open(HISTORICAL_DIR / "metadata.json") as _f:
                 _meta = _json.load(_f)
+        elif r2_cfg and not local_available:
+            _meta = load_r2_metadata(r2_cfg)
         _fetched_at = _meta.get("last_fetch_utc", "unknown")[:19].replace("T", " ")
-        st.caption(f"Local snapshot last updated: **{_fetched_at} UTC**")
+        _source_label = "local" if local_available else "R2"
+        st.caption(f"Snapshot ({_source_label}) last updated: **{_fetched_at} UTC**")
         use_local = st.radio(
             "Load from",
-            ["📂 Local historical data", "🌐 Live API"],
+            ["📂 Historical data", "🌐 Live API"],
             index=0,
-        ) == "📂 Local historical data"
+        ) == "📂 Historical data"
     else:
         use_local = False
-        st.caption("No local snapshot found. Run `get_historical_data.py` to create one.")
+        st.caption("No snapshot found. Run `get_historical_data.py --upload` to create one.")
 
     st.divider()
 
@@ -280,10 +398,14 @@ with st.sidebar:
 
     st.divider()
     refresh = st.button("🔄 Refresh data", use_container_width=True)
+    if refresh:
+        fetch_wallet_data.clear()
 
     st.caption(
         "Rate limit: **500 req / hour**. "
-        "Data syncs from the Wallet app asynchronously."
+        "Data syncs from the Wallet app asynchronously.\n\n"
+        "Data is **cached** after the first load. "
+        "Click Refresh to fetch new data from the API."
     )
 
 
@@ -304,17 +426,27 @@ if not token:
 
 # ── Fetch data ─────────────────────────────────────────────────────────────────
 if use_local:
-    with st.spinner("Loading from local historical data…"):
-        df = pd.read_parquet(HISTORICAL_DIR / "records.parquet")
+    with st.spinner("Loading historical data…"):
+        # Prefer local parquet files; fall back to R2
+        if local_available:
+            df = pd.read_parquet(HISTORICAL_DIR / "records.parquet")
+            acc_df = pd.read_parquet(HISTORICAL_DIR / "accounts.parquet") if (HISTORICAL_DIR / "accounts.parquet").exists() else pd.DataFrame()
+            cat_df = pd.read_parquet(HISTORICAL_DIR / "categories.parquet") if (HISTORICAL_DIR / "categories.parquet").exists() else pd.DataFrame()
+        else:
+            # Load from R2
+            df = load_r2_parquet(r2_cfg["endpoint"], r2_cfg["access_key"], r2_cfg["secret_key"], r2_cfg["bucket"], "records.parquet")
+            acc_df = load_r2_parquet(r2_cfg["endpoint"], r2_cfg["access_key"], r2_cfg["secret_key"], r2_cfg["bucket"], "accounts.parquet") or pd.DataFrame()
+            cat_df = load_r2_parquet(r2_cfg["endpoint"], r2_cfg["access_key"], r2_cfg["secret_key"], r2_cfg["bucket"], "categories.parquet") or pd.DataFrame()
+            if df is None:
+                st.error("Could not load data from R2. Check your R2 credentials.")
+                st.stop()
 
-        # Extract amount from nested baseAmount dict (API stores {value, currencyCode})
         if "baseAmount" in df.columns:
             df["amount"] = df["baseAmount"].apply(
                 lambda x: x["value"] if isinstance(x, dict) and "value" in x else None
             )
-        df["amount"]     = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
 
-        # Extract category info from nested category dict
         if "category" in df.columns and df["category"].apply(lambda x: isinstance(x, dict)).any():
             df["categoryId"] = df["category"].apply(
                 lambda x: x.get("id") if isinstance(x, dict) else None
@@ -324,104 +456,49 @@ if use_local:
             )
 
         df["recordDate"] = pd.to_datetime(df["recordDate"], errors="coerce", utc=True)
-        df["recordDate"] = df["recordDate"].dt.tz_localize(None)  # make tz-naive for comparisons
+        df["recordDate"] = df["recordDate"].dt.tz_localize(None)
 
-        # Ensure all expected columns exist (parity with Live API path)
         for col in ["amount", "payee", "note", "recordDate", "categoryId", "accountId", "type"]:
             if col not in df.columns:
                 df[col] = None
 
-        # Keep a full copy before filtering (used for period comparison)
-        df_all_raw = df.copy()
-
-        # Apply date filter on the full local dataset
-        mask = (
-            (df["recordDate"].dt.date >= date_from) &
-            (df["recordDate"].dt.date <= date_to)
-        )
-        if min_amount > 0:
-            mask &= df["amount"].abs() >= min_amount
-        if max_amount > 0:
-            mask &= df["amount"].abs() <= max_amount
-        if payee_filter and "payee" in df.columns:
-            mask &= df["payee"].str.contains(payee_filter, case=False, na=False)
-        if note_filter and "note" in df.columns:
-            mask &= df["note"].str.contains(note_filter, case=False, na=False)
-        df = df[mask].copy()
-
-        # Load reference tables
-        acc_df  = pd.read_parquet(HISTORICAL_DIR / "accounts.parquet")   if (HISTORICAL_DIR / "accounts.parquet").exists()   else pd.DataFrame()
-        cat_df  = pd.read_parquet(HISTORICAL_DIR / "categories.parquet") if (HISTORICAL_DIR / "categories.parquet").exists() else pd.DataFrame()
         account_map  = dict(zip(acc_df["id"], acc_df["name"])) if not acc_df.empty and "id" in acc_df.columns else {}
-        # Build category map: start from categories parquet, then overlay inline names from full data
         category_map = dict(zip(cat_df["id"], cat_df["name"])) if not cat_df.empty and "id" in cat_df.columns else {}
-        if "categoryId" in df_all_raw.columns and "categoryName" in df_all_raw.columns:
-            category_map.update(dict(zip(df_all_raw["categoryId"].dropna(), df_all_raw["categoryName"].dropna())))
+        if "categoryId" in df.columns and "categoryName" in df.columns:
+            category_map.update(dict(zip(df["categoryId"].dropna(), df["categoryName"].dropna())))
         accounts_display = acc_df
 
-    st.info("📂 Showing data from local snapshot. Switch to **Live API** in the sidebar to fetch fresh data.")
+    _src = "local snapshot" if local_available else "R2 cloud storage"
+    st.info(f"📂 Showing data from {_src}. Switch to **Live API** in the sidebar to fetch fresh data.")
 
 else:
-    with st.spinner("Fetching your financial data from the API…"):
-        # Fetch ALL records (no date filter) so comparison feature can access any date range
-        records_raw    = fetch_all_pages(token, "/records", {"limit": 200})
-        accounts_raw   = api_get(token, "/accounts") or []
-        categories_raw = api_get(token, "/categories") or []
-
-    if isinstance(accounts_raw, dict):
-        accounts_raw   = accounts_raw.get("accounts") or accounts_raw.get("items") or []
-    if isinstance(categories_raw, dict):
-        categories_raw = categories_raw.get("categories") or categories_raw.get("items") or []
-
-    account_map  = {a["id"]: a.get("name", a["id"]) for a in accounts_raw}
-    category_map = {c["id"]: c.get("name", c["id"]) for c in categories_raw}
-    accounts_display = pd.DataFrame(accounts_raw)
+    # Cached fetch – API is only called on first load or after clicking Refresh
+    records_raw, accounts_raw, categories_raw = fetch_wallet_data(token)
 
     if not records_raw:
         st.warning("No records found.")
         st.stop()
 
-    df = pd.DataFrame(records_raw)
-    for col in ["amount", "payee", "note", "recordDate", "categoryId", "accountId", "type"]:
-        if col not in df.columns:
-            df[col] = None
-
-    # Extract amount from nested baseAmount dict
-    if "baseAmount" in df.columns:
-        df["amount"] = df["baseAmount"].apply(
-            lambda x: x["value"] if isinstance(x, dict) and "value" in x else None
-        )
-    df["amount"]     = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
-
-    # Extract category info from nested category dict
-    if "category" in df.columns and df["category"].apply(lambda x: isinstance(x, dict)).any():
-        df["categoryId"] = df["category"].apply(
-            lambda x: x.get("id") if isinstance(x, dict) else None
-        )
-        df["categoryName"] = df["category"].apply(
-            lambda x: x.get("name") if isinstance(x, dict) else None
-        )
-
-    df["recordDate"] = pd.to_datetime(df["recordDate"], errors="coerce", utc=True)
-    df["recordDate"] = df["recordDate"].dt.tz_localize(None)  # make tz-naive (parity with local path)
-
-    # Keep full copy before filtering (used for period comparison)
-    df_all_raw = df.copy()
-
-    # Apply same client-side filters as local path
-    mask = (
-        (df["recordDate"].dt.date >= date_from) &
-        (df["recordDate"].dt.date <= date_to)
+    df, account_map, category_map, accounts_display = build_dataframe(
+        records_raw, accounts_raw, categories_raw,
     )
-    if min_amount > 0:
-        mask &= df["amount"].abs() >= min_amount
-    if max_amount > 0:
-        mask &= df["amount"].abs() <= max_amount
-    if payee_filter and "payee" in df.columns:
-        mask &= df["payee"].str.contains(payee_filter, case=False, na=False)
-    if note_filter and "note" in df.columns:
-        mask &= df["note"].str.contains(note_filter, case=False, na=False)
-    df = df[mask].copy()
+
+# ── Apply client-side filters (no API call) ────────────────────────────────────
+df_all_raw = df.copy()  # full dataset for period comparison
+
+mask = (
+    (df["recordDate"].dt.date >= date_from) &
+    (df["recordDate"].dt.date <= date_to)
+)
+if min_amount > 0:
+    mask &= df["amount"].abs() >= min_amount
+if max_amount > 0:
+    mask &= df["amount"].abs() <= max_amount
+if payee_filter and "payee" in df.columns:
+    mask &= df["payee"].str.contains(payee_filter, case=False, na=False)
+if note_filter and "note" in df.columns:
+    mask &= df["note"].str.contains(note_filter, case=False, na=False)
+df = df[mask].copy()
 
 # ── Shared post-processing ─────────────────────────────────────────────────────
 for col in ["amount", "payee", "note", "recordDate", "categoryId", "accountId", "type"]:

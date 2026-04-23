@@ -43,6 +43,13 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+try:
+    import boto3
+    from botocore.config import Config as BotoConfig
+    HAS_BOTO3 = True
+except ImportError:
+    HAS_BOTO3 = False
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 load_dotenv()
 
@@ -55,6 +62,12 @@ META_FILE  = OUTPUT_DIR / "metadata.json"
 PAGE_SIZE  = 200
 # Pause between pages to stay well under the 500 req/hour rate limit
 PAGE_DELAY = 0.05   # seconds
+
+# R2 config (optional – only needed for --upload)
+R2_ENDPOINT          = os.getenv("R2_ENDPOINT", "")
+R2_ACCESS_KEY_ID     = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET            = os.getenv("R2_BUCKET", "")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -168,6 +181,25 @@ def to_parquet(df: pd.DataFrame, name: str, also_csv: bool = False) -> None:
         print(f"  📄 Also saved {csv_path}  ({csv_kb:.1f} KB)")
 
 
+def upload_to_r2(file_path: Path) -> None:
+    """Upload a local file to Cloudflare R2."""
+    if not HAS_BOTO3:
+        print("  ✗ boto3 not installed. Run: pip install boto3")
+        return
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=BotoConfig(signature_version="s3v4"),
+        region_name="auto",
+    )
+    key = file_path.name  # e.g. "records.parquet"
+    s3.upload_file(str(file_path), R2_BUCKET, key)
+    size_kb = file_path.stat().st_size / 1024
+    print(f"  ☁️  Uploaded {key} to R2  ({size_kb:.1f} KB)")
+
+
 # ── Dataset fetchers ───────────────────────────────────────────────────────────
 def fetch_records(since: str | None = None) -> pd.DataFrame:
     """Fetch transactions. If `since` is given, only fetch newer ones."""
@@ -229,10 +261,20 @@ def main() -> None:
     parser.add_argument("--csv",    action="store_true", help="Also export CSV copies.")
     parser.add_argument("--update", action="store_true",
                         help="Incremental: only fetch records newer than the last saved run.")
+    parser.add_argument("--upload", action="store_true",
+                        help="Upload parquet files to Cloudflare R2 after saving locally.")
     args = parser.parse_args()
 
     if not TOKEN:
         print("✗ API_TOKEN not found in .env. Aborting.")
+        sys.exit(1)
+
+    if args.upload and not all([R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET]):
+        print("✗ R2 credentials not found in .env. Add R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET.")
+        sys.exit(1)
+
+    if args.upload and not HAS_BOTO3:
+        print("✗ boto3 is required for --upload. Run: pip install boto3")
         sys.exit(1)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -301,7 +343,15 @@ def main() -> None:
         "incremental_run":  args.update,
     })
     save_metadata(meta)
-
+    # ── Upload to R2 ──────────────────────────────────────────────────────────
+    if args.upload:
+        print("\n☁️  Uploading to Cloudflare R2…")
+        for name in ["records", "accounts", "categories"]:
+            fpath = OUTPUT_DIR / f"{name}.parquet"
+            if fpath.exists():
+                upload_to_r2(fpath)
+        # Also upload metadata.json
+        upload_to_r2(META_FILE)
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n══════════════════════════════════════════")
     print("  ✅ Done!")
