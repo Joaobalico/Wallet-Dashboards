@@ -8,6 +8,7 @@ import hmac
 import io
 import json as _json
 import os
+import sys
 from pathlib import Path
 
 import streamlit as st
@@ -428,6 +429,23 @@ with st.sidebar:
     refresh = st.button("🔄 Refresh data", use_container_width=True)
     if refresh:
         fetch_wallet_data.clear()
+
+    update_snapshot = st.button("📸 Update snapshot", use_container_width=True,
+                                help="Fetches all data from the API and saves a local snapshot (incremental).")
+    if update_snapshot:
+        import subprocess
+        with st.spinner("Updating local snapshot…"):
+            result = subprocess.run(
+                [sys.executable, "get_historical_data.py", "--update", "--upload"],
+                capture_output=True, text=True, timeout=120,
+            )
+        if result.returncode == 0:
+            st.success("Snapshot updated!")
+            fetch_wallet_data.clear()
+            st.rerun()
+        else:
+            st.error("Snapshot update failed.")
+            st.code(result.stderr or result.stdout, language="text")
 
     st.caption(
         "Rate limit: **500 req / hour**. "

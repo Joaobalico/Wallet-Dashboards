@@ -200,13 +200,36 @@ def upload_to_r2(file_path: Path) -> None:
     print(f"  ☁️  Uploaded {key} to R2  ({size_kb:.1f} KB)")
 
 
+def download_from_r2(key: str, dest: Path) -> bool:
+    """Download a file from R2 to a local path. Returns True on success."""
+    if not HAS_BOTO3 or not all([R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET]):
+        return False
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=BotoConfig(signature_version="s3v4"),
+            region_name="auto",
+        )
+        s3.download_file(R2_BUCKET, key, str(dest))
+        size_kb = dest.stat().st_size / 1024
+        print(f"  ☁️  Downloaded {key} from R2  ({size_kb:.1f} KB)")
+        return True
+    except Exception as e:
+        print(f"  ℹ Could not download {key} from R2: {e}")
+        return False
+
+
 # ── Dataset fetchers ───────────────────────────────────────────────────────────
 def fetch_records(since: str | None = None) -> pd.DataFrame:
-    """Fetch transactions. If `since` is given, only fetch newer ones."""
+    """Fetch transactions. If `since` is given, fetch new + updated records."""
     params = {}
     if since:
-        params["recordDate"] = f"gte.{since}"
-        print(f"  → Incremental mode: fetching records from {since} onward")
+        # Use updatedAt to catch both new records and edits to past records
+        params["updatedAt"] = f"gte.{since}"
+        print(f"  → Incremental mode: fetching records updated since {since}")
     else:
         # No date filter — paginate through all records the API has
         print("  → Full mode: fetching all available records")
@@ -289,12 +312,33 @@ def main() -> None:
     existing_records = pd.DataFrame()
 
     if args.update and "last_fetch_utc" in meta:
-        # Use the last known most-recent record date as the lower bound
-        since = meta.get("latest_record_date")
+        # Use the last fetch timestamp so we catch both new and edited records
+        since = meta["last_fetch_utc"]
         records_path = OUTPUT_DIR / "records.parquet"
         if records_path.exists():
-            print("📂 Loading existing records to merge with new ones…")
+            print("📂 Loading existing records from local snapshot…")
             existing_records = pd.read_parquet(records_path)
+        else:
+            # No local snapshot — try to pull from R2 (e.g. running on cloud)
+            print("📂 No local snapshot found. Trying R2…")
+            if download_from_r2("records.parquet", records_path):
+                existing_records = pd.read_parquet(records_path)
+            # Also pull metadata from R2 if local was empty
+            if not META_FILE.exists():
+                download_from_r2("metadata.json", META_FILE)
+                meta = load_metadata()
+                since = meta.get("last_fetch_utc")
+    elif args.update:
+        # First run with --update but no prior metadata — try R2
+        records_path = OUTPUT_DIR / "records.parquet"
+        if not records_path.exists():
+            print("📂 No local data or metadata. Trying R2…")
+            download_from_r2("records.parquet", records_path)
+            download_from_r2("metadata.json", META_FILE)
+            meta = load_metadata()
+            since = meta.get("last_fetch_utc")
+            if records_path.exists():
+                existing_records = pd.read_parquet(records_path)
 
     print("📥 Fetching records (transactions)…")
     new_records = fetch_records(since=since)
