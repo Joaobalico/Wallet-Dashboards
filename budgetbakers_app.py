@@ -1109,6 +1109,11 @@ with tab4:
         # Compare with last year
         default_cmp_from = date(today.year - 1, 1, 1)
         default_cmp_to = date(today.year - 1, 12, 31)
+    elif quick_range in ("Jump", "Last Month"):
+        # Compare with the month before the selected month
+        prev_month_end = date_from - timedelta(days=1)
+        default_cmp_from = prev_month_end.replace(day=1)
+        default_cmp_to = prev_month_end
     else:  # Custom – mirror same length before
         current_days = (date_to - date_from).days
         default_cmp_to = date_from - timedelta(days=1)
@@ -1117,9 +1122,10 @@ with tab4:
     default_cmp_from = max(default_cmp_from, all_min)
     default_cmp_to = max(default_cmp_to, all_min)
 
-    # Force-update comparison dates when quick_range changes
-    if st.session_state.get("_last_quick_range") != quick_range:
-        st.session_state["_last_quick_range"] = quick_range
+    # Force-update comparison dates when quick_range or jump_month changes
+    _range_key = f"{quick_range}:{jump_month}" if quick_range == "Jump" else quick_range
+    if st.session_state.get("_last_quick_range") != _range_key:
+        st.session_state["_last_quick_range"] = _range_key
         st.session_state["cmp_from"] = default_cmp_from
         st.session_state["cmp_to"] = default_cmp_to
 
