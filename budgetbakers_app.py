@@ -310,10 +310,7 @@ with st.sidebar:
         if r2_cfg and not _meta:
             _meta = load_r2_metadata(r2_cfg)
         _fetched_at = _meta.get("last_fetch_utc", "unknown")[:19].replace("T", " ")
-        if r2_cfg:
-            _source_label = "stored in R2"
-        else:
-            _source_label = "locally stored"
+        _source_label = "locally stored" if local_available else "stored in R2"
         st.caption(f"Snapshot ({_source_label}) last updated: **{_fetched_at} UTC**")
         use_local = st.radio(
             "Load from",
