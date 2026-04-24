@@ -341,7 +341,7 @@ with st.sidebar:
 
     quick_range_radio = st.radio(
         "Quick range",
-        ["Custom", "Today", "This Week", "This Month", "6 Months", "This Year"],
+        ["Custom", "Today", "This Week", "This Month", "Last Month", "6 Months", "This Year"],
         index=None if is_default else 0,
         horizontal=True,
         key="quick_range",
@@ -349,9 +349,32 @@ with st.sidebar:
         on_change=_on_quick_range_change,
     )
 
-    quick_range = "Default" if is_default else (quick_range_radio or "Custom")
+    # Month picker dropdown
+    _month_options = ["—"]
+    _m = today.replace(day=1)
+    for _ in range(12):
+        _month_options.append(_m.strftime("%B %Y"))
+        _m = (_m - timedelta(days=1)).replace(day=1)
+    jump_month = st.selectbox(
+        "Jump to month",
+        _month_options,
+        index=0,
+        key="jump_month",
+        disabled=is_default,
+    )
 
-    if quick_range == "Default":
+    quick_range = "Default" if is_default else (quick_range_radio or "Custom")
+    if jump_month != "—" and not is_default:
+        quick_range = "Jump"
+
+    if quick_range == "Jump":
+        from calendar import monthrange
+        _parsed = pd.Timestamp(jump_month).date()
+        _qfrom = _parsed.replace(day=1)
+        _qto = _parsed.replace(day=monthrange(_parsed.year, _parsed.month)[1])
+        if _qto > today:
+            _qto = today
+    elif quick_range == "Default":
         # From the most recent 26th to today
         if today.day >= 26:
             _qfrom = today.replace(day=26)
@@ -368,6 +391,11 @@ with st.sidebar:
     elif quick_range == "This Month":
         _qfrom = today.replace(day=1)
         _qto = today
+    elif quick_range == "Last Month":
+        first_this_month = today.replace(day=1)
+        last_month_end = first_this_month - timedelta(days=1)
+        _qfrom = last_month_end.replace(day=1)
+        _qto = last_month_end
     elif quick_range == "6 Months":
         _qfrom = (today.replace(day=1) - timedelta(days=180)).replace(day=1)
         _qto = today
@@ -556,12 +584,23 @@ if exclude_labels:
 # Exclude transfers – they are not real income/expenses
 # But keep transfers labelled "Savings" for the By Label view
 TRANSFER_CATEGORIES = ["Transfer, withdraw"]
+
+# Categories that represent genuine income (positive amounts in other
+# categories are treated as refunds and reduce the Expenses total)
+INCOME_CATEGORIES = ["Income", "Wage, invoices", "Interests, dividends", "Meal card"]
 is_transfer = df["category"].isin(TRANSFER_CATEGORIES)
 has_savings_label = df["label"].str.contains(
     "Savings", case=False, na=False
 )
 savings_transfers = df[is_transfer & has_savings_label].copy()
 df = df[~is_transfer].copy()
+
+# Exclude virtual / budget accounts whose records are not real transactions
+EXCLUDE_ACCOUNTS = ["Gastos fixos(média)", "Disney"]
+df = df[~df["account"].isin(EXCLUDE_ACCOUNTS)].copy()
+
+# Exclude test transactions
+df = df[~df["note"].str.contains(r"\btests?\b", case=False, na=False)].copy()
 
 # Build df_all: full dataset with same post-processing (for period comparison)
 df_all = df_all_raw.copy()
@@ -586,6 +625,8 @@ if exclude_labels:
         lambda x: any(lbl in x for lbl in exclude_labels) if isinstance(x, str) else False
     )].copy()
 df_all = df_all[~df_all["category"].isin(TRANSFER_CATEGORIES)].copy()
+df_all = df_all[~df_all["account"].isin(EXCLUDE_ACCOUNTS)].copy()
+df_all = df_all[~df_all["note"].str.contains(r"\btests?\b", case=False, na=False)].copy()
 df_all["day"] = df_all["recordDate"].dt.date
 df_all["month"] = df_all["recordDate"].dt.to_period("M").astype(str)
 df_all["weekday"] = df_all["recordDate"].dt.day_name()
@@ -599,8 +640,9 @@ df["day"] = df["recordDate"].dt.date
 df["month"] = df["recordDate"].dt.to_period("M").astype(str)
 df["weekday"] = df["recordDate"].dt.day_name()
 
-expenses = df[df["amount"] < 0]["amount"].sum()
-income = df[df["amount"] > 0]["amount"].sum()
+is_income_cat = df["category"].isin(INCOME_CATEGORIES)
+income = df[is_income_cat]["amount"].sum()
+expenses = df[~is_income_cat]["amount"].sum()   # negatives + refunds (net outflow)
 net = income + expenses
 num_days = max((date_to - date_from).days, 1)
 avg_daily_expense = abs(expenses) / num_days
@@ -873,18 +915,18 @@ with tab2:
 
 # ── Tab 3: By Account ─────────────────────────────────────
 with tab3:
-    acc_summary = (
-        df.groupby("account")
-        .agg(
-            Income=("amount", lambda x: x[x > 0].sum()),
-            Expenses=("amount", lambda x: x[x < 0].sum()),
-            Net=("amount", "sum"),
-            Transactions=("amount", "count"),
-        )
-        .reset_index()
-        .sort_values("Net")
-    )
-    acc_summary["Expenses"] = acc_summary["Expenses"].abs()
+    _inc_mask = df["category"].isin(INCOME_CATEGORIES)
+    _inc_by_acc = df[_inc_mask].groupby("account")["amount"].sum()
+    _exp_by_acc = df[~_inc_mask].groupby("account")["amount"].sum()
+    _net_by_acc = df.groupby("account")["amount"].sum()
+    _cnt_by_acc = df.groupby("account")["amount"].count()
+    acc_summary = pd.DataFrame({
+        "account": _net_by_acc.index,
+        "Income": _inc_by_acc.reindex(_net_by_acc.index, fill_value=0).values,
+        "Expenses": _exp_by_acc.reindex(_net_by_acc.index, fill_value=0).abs().values,
+        "Net": _net_by_acc.values,
+        "Transactions": _cnt_by_acc.reindex(_net_by_acc.index, fill_value=0).values,
+    }).sort_values("Net")
 
     fig_acc = go.Figure()
     fig_acc.add_trace(go.Bar(
@@ -930,8 +972,9 @@ with tab3:
 
     if selected_account:
         acc_df_drill = df[df["account"] == selected_account]
-        acc_inc = acc_df_drill[acc_df_drill["amount"] > 0]["amount"].sum()
-        acc_exp = acc_df_drill[acc_df_drill["amount"] < 0]["amount"].sum()
+        _acc_inc_mask = acc_df_drill["category"].isin(INCOME_CATEGORIES)
+        acc_inc = acc_df_drill[_acc_inc_mask]["amount"].sum()
+        acc_exp = acc_df_drill[~_acc_inc_mask]["amount"].sum()
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Income", f"{CURRENCY}{acc_inc:,.2f}")
@@ -1081,8 +1124,9 @@ with tab4:
         df_b = df_all[(df_all["day"] >= cmp_from) & (df_all["day"] <= cmp_to)]
 
         def _period_stats(period_df, start, end):
-            inc = period_df[period_df["amount"] > 0]["amount"].sum()
-            exp = period_df[period_df["amount"] < 0]["amount"].sum()
+            _p_inc_mask = period_df["category"].isin(INCOME_CATEGORIES)
+            inc = period_df[_p_inc_mask]["amount"].sum()
+            exp = period_df[~_p_inc_mask]["amount"].sum()
             days = max((end - start).days, 1)
             return {
                 "Income": inc,
@@ -1638,7 +1682,7 @@ with tab8:
     # Use df_all (full unfiltered history) for forecasting
     hist = df_all.copy()
     hist_exp = hist[hist["amount"] < 0].copy()
-    hist_inc = hist[hist["amount"] > 0].copy()
+    hist_inc = hist[hist["category"].isin(INCOME_CATEGORIES)].copy()
 
     # Dynamic recent-window size: scales with available data
     # 3-5 mo data → 3, 6-11 → 4, 12-23 → 6, 24+ → 12
@@ -2014,16 +2058,19 @@ with tab8:
         )
         payee_stats["std_amount"] = payee_stats["std_amount"].fillna(0)
         payee_stats["frequency"] = payee_stats["months_present"] / max(total_months, 1)
-        # Recurring = appears in >50% of months with low relative variability
         payee_stats["cv"] = np.where(
             payee_stats["avg_amount"] > 0,
             payee_stats["std_amount"] / payee_stats["avg_amount"],
             999,
         )
+        # Adaptive thresholds: relax with less history
+        min_months = 2 if total_months <= 6 else 3
+        min_freq = 0.4 if total_months <= 6 else 0.5
+        max_cv = 0.6 if total_months <= 6 else 0.5
         recurring = payee_stats[
-            (payee_stats["frequency"] >= 0.5)
-            & (payee_stats["months_present"] >= 3)
-            & (payee_stats["cv"] < 0.5)
+            (payee_stats["frequency"] >= min_freq)
+            & (payee_stats["months_present"] >= min_months)
+            & (payee_stats["cv"] < max_cv)
         ].sort_values("total", ascending=False)
 
         if not recurring.empty:
