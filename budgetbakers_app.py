@@ -611,13 +611,19 @@ has_savings_label = df["label"].str.contains(
     "Savings", case=False, na=False
 )
 savings_transfers = df[is_transfer & has_savings_label].copy()
-df = df[~is_transfer].copy()
 
 # Exclude virtual / budget accounts whose records are not real transactions
 EXCLUDE_ACCOUNTS = ["Gastos fixos(média)", "Disney"]
-df = df[~df["account"].isin(EXCLUDE_ACCOUNTS)].copy()
 
 # Exclude test transactions
+# Keep a copy with ALL transaction types (incl. transfers) for the Transactions tab
+df_with_transfers = df[
+    ~df["account"].isin(EXCLUDE_ACCOUNTS)
+    & ~df["note"].str.contains(r"\btests?\b", case=False, na=False)
+].copy()
+
+df = df[~is_transfer].copy()
+df = df[~df["account"].isin(EXCLUDE_ACCOUNTS)].copy()
 df = df[~df["note"].str.contains(r"\btests?\b", case=False, na=False)].copy()
 
 # Build df_all: full dataset with same post-processing (for period comparison)
@@ -1486,13 +1492,30 @@ with tab5:
 
 # ── Tab 6: Transactions ───────────────────────────────────
 with tab6:
+    tx_type_filter = st.radio(
+        "Transaction type",
+        ["All", "Expenses", "Income", "Transfers"],
+        horizontal=True,
+        key="tx_type_filter",
+    )
+    _tx_df = df_with_transfers.copy()
+    if tx_type_filter == "Expenses":
+        _tx_df = _tx_df[
+            ~_tx_df["category"].isin(INCOME_CATEGORIES)
+            & ~_tx_df["category"].isin(TRANSFER_CATEGORIES)
+        ]
+    elif tx_type_filter == "Income":
+        _tx_df = _tx_df[_tx_df["category"].isin(INCOME_CATEGORIES)]
+    elif tx_type_filter == "Transfers":
+        _tx_df = _tx_df[_tx_df["category"].isin(TRANSFER_CATEGORIES)]
+
     display_cols = [
         "recordDate", "payee", "category",
         "account", "amount", "label", "note",
     ]
-    display_cols = [c for c in display_cols if c in df.columns]
+    display_cols = [c for c in display_cols if c in _tx_df.columns]
     show_df = (
-        df[display_cols]
+        _tx_df[display_cols]
         .sort_values("recordDate", ascending=False)
         .rename(columns={
             "recordDate": "Date",
